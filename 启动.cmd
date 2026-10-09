@@ -57,14 +57,13 @@ echo 正在启动 tiny11builder，请稍候...
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0tiny11builder.ps1" %*
 set "RC=%errorlevel%"
+rem 脚本自己已经在清屏后打印了完成横幅，这里只补充按键提示，不再重复报告运行状态。
 echo.
-if "%RC%"=="0" (
-    echo 运行结束。
-) else (
-    echo 运行结束，但未能正常完成（退出码 %RC%）。
+if not "%RC%"=="0" (
+    echo 本次未能正常完成（退出码 %RC%）。
     echo 请把本窗口最后几行内容发给维护者；日志文件在本文件夹的 LOG 子目录里。
+    echo.
 )
-echo.
 echo 按任意键关闭本窗口...
 pause >nul
 endlocal

@@ -3,9 +3,7 @@
     精简 Windows 11：制作精简 ISO / 精简当前系统 / 独立维护小工具（多模式中文版）。
 #>
 
-#---------[ 版本（作者自查用，不在界面与日志中显示）]---------#
-# 当前版本：3.2
-# 记录规则：小更新 +0.1，大更新 +1.0。
+# 版本 3.4
 
 #---------[ 参数 ]---------#
 param (
@@ -683,22 +681,45 @@ function Remove-RunningLock {
     } catch { }
 }
 
+# 统一的「执行结果横幅」：脚本执行阶段（含成功、取消、异常）都用它把结果醒目地打在控制台上。
+# 之所以自己画框而不用 Write-Output，是因为输出要带颜色、且不能被脚本自定义的时间戳 Write-Output 加工。
+# Color 取值：Green=成功 / Yellow=取消 / Red=失败。
+function Write-ResultBanner {
+    param (
+        [string]$Color = 'Green',
+        [string[]]$Lines = @()
+    )
+    $bar = '  ============================================================'
+    Write-Host ''
+    Write-Host $bar -ForegroundColor $Color
+    foreach ($ln in $Lines) { Write-Host "    $ln" -ForegroundColor $Color }
+    Write-Host $bar -ForegroundColor $Color
+    Write-Host ''
+}
+
 function Stop-AndExit {
     param (
-        [int]$Code = 1
+        [int]$Code = 1,
+        [string]$Reason = ''
     )
     # 中止脚本前先释放单实例锁，再停掉转录，保证日志有结尾标记且内容已刷盘。
     # 未开启转录时 Stop-Transcript 会抛异常，故忽略。
     Remove-RunningLock
     try { Stop-Transcript | Out-Null } catch { }
-    # 图形界面模式下用弹窗告知中止，用户不必去读控制台窗口。
-    # （$script:GuiMode 为真时 WinForms 程序集必然已加载，因此这里直接调用是安全的。）
-    if ($script:GuiMode -and $Code -ne 0) {
-        try {
-            [void][System.Windows.Forms.MessageBox]::Show(
-                ("脚本已中止（退出码 {0}），本次没有完成。`n`n请把窗口里最后几行内容（或 LOG 目录下的日志文件）发给维护者：`n{1}\LOG" -f $Code, $PSScriptRoot),
-                'tiny11builder — 未能完成', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        } catch { }
+    # 执行阶段的提示一律走控制台（窗口只用于开头的参数收集）：
+    # 若开启过转录，先清屏抹掉 Stop-Transcript 自带的「已停止脚本」那行，再打结果横幅。
+    try { Clear-Host } catch { }
+    if ($Code -eq 0) {
+        # 正常退出：没有特别说明时按「用户主动取消」处理
+        if (-not $Reason) { $Reason = '已取消，本次未做任何改动。' }
+        Write-ResultBanner -Color 'Yellow' -Lines @($Reason)
+    } else {
+        if (-not $Reason) { $Reason = '脚本已中止，本次没有完成。' }
+        Write-ResultBanner -Color 'Red' -Lines @(
+            $Reason + "（退出码 $Code）",
+            '请把本窗口最后几行内容（或 LOG 目录下的日志文件）发给维护者：',
+            "$PSScriptRoot\LOG"
+        )
     }
     exit $Code
 }
@@ -706,8 +727,9 @@ function Stop-AndExit {
 #---------[ 图形界面（WinForms）参数收集 ]---------#
 # 目标：让完全不用命令行的人也能用 —— 双击入口后由窗口收集参数，界面里可直接选 .iso 文件并由脚本
 # 自动挂载；用户不需要理解「执行策略」「管理员提权」「盘符」「映像索引」这些概念。
-# 约定：窗口只负责【收集参数】，收集完立即关闭，后续构建仍在控制台窗口里逐行输出日志
-#       （长任务的日志在控制台里更易读，出错时也便于整段复制排查）。
+# 约定：窗口只负责【收集参数】，收集完立即关闭；后续构建全部在控制台窗口里进行 ——
+#       包括各种提示、操作、结果展示、异常报警，一直到最后的「按任意键关闭」。
+#       （长任务的日志在控制台里更易读，出错时也便于整段复制排查。）
 # 静默用法（-ISO / -SCRATCH / -Mode 三者齐全）不经过窗口，行为与以前完全一致。
 #
 # 说明：以下所有控件都挂到 $script: 作用域。原因：按钮的 Click 事件脚本块在不同作用域下
@@ -726,20 +748,11 @@ function New-GuiFont {
     return (New-Object System.Drawing.Font('Arial', 9))
 }
 
-function Show-GuiMessage {
-    param ([string]$Text, [string]$Title = 'tiny11builder')
-    try { [void][System.Windows.Forms.MessageBox]::Show($Text, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) } catch { }
-}
-
+# 下面两个弹窗只在【参数收集窗口】内部使用（校验输入、装载 ISO 失败等），
+# 属于「用户还在窗口里」的阶段。执行阶段的任何提示都不要再用它们，一律走控制台输出。
 function Show-GuiError {
     param ([string]$Text, [string]$Title = 'tiny11builder')
     try { [void][System.Windows.Forms.MessageBox]::Show($Text, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) } catch { }
-}
-
-function Show-GuiDone {
-    # 完成提示：图形界面模式下用它告知结果，用户不必去读控制台窗口
-    param ([string]$Text)
-    try { [void][System.Windows.Forms.MessageBox]::Show($Text, 'tiny11builder — 已完成', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) } catch { }
 }
 
 function Show-GuiConfirm {
@@ -1353,8 +1366,9 @@ if ($cleanCount -eq 0 -and $skipCount -eq 0) {
         Write-Output "将要执行：卸载上述配置单元 → 丢弃式卸载上述挂载映像（中止会话的改动一律不保存）→ 必要时结束滞留的 DISM worker → 清理孤儿记录 → 全部终结后才删除上述临时目录。"
         Write-Output "不会动其它任何文件，也不会动上面「只报告」的那些。"
         Write-Output " "
+        # 残留清除发生在施工之前，因此图形界面下仍用弹窗确认（与其它施工前的交互一致）。
         if ($script:GuiMode) {
-            $cleanConfirm = $(if (Show-GuiConfirm "检测到上次运行留下的残留（明细见后方的窗口）。`n`n必须清除这些残留才能继续，否则本次挂载映像可能失败。`n`n确认清除并继续吗？") { 'Y' } else { 'N' })
+            $cleanConfirm = $(if (Show-GuiConfirm "检测到上次运行留下的残留（明细见前方的控制台窗口）。`n`n必须清除这些残留才能继续，否则本次挂载映像可能失败。`n`n确认清除并继续吗？") { 'Y' } else { 'N' })
         } else {
             $cleanConfirm = Read-Host "确认清除以上残留并继续？(Y/N)（输入其它内容则退出脚本，不做任何改动）"
         }
@@ -1390,8 +1404,8 @@ Write-Output " "
 
 #---------[ 图形界面：收集参数（在残留清理之后、选择操作对象之前）]---------#
 # 顺序刻意放在「残留清理」之后：上次运行的残留无论如何都要先处理完，再让用户做选择。
-# 本段只把窗口收集到的答案注入后续流程；后续所有 Read-Host 都有「界面已提供则跳过」的守卫，
-# 因此确认之后的构建阶段依然全程无人值守。
+# 边界：窗口只用于【开头收集参数】，收集完立即关闭；之后的选择、确认、提示、
+#       结果展示与异常报警全部在控制台里完成（不再出现任何窗口）。
 if ($script:GuiMode) {
     # 以下整段是窗口成功时的参数注入；窗口出错时上面已把界面模式关掉，这段会被跳过
     Write-Output "正在打开操作窗口，请在窗口中完成选择..."
@@ -1800,10 +1814,7 @@ if ($script:TaskType -in @('disable-defender', 'restore-defender', 'disable-wu',
         'clean-junk'       { Write-Output "已选择：【清理本机垃圾文件】"; Invoke-JunkCleanup -Root $env:SystemDrive }
     }
     Write-Output " "
-    if ($script:GuiMode) {
-        Show-GuiDone "所选操作已完成。`n`n详细过程见本窗口，日志同时保存在：`n$PSScriptRoot\LOG"
-    }
-    Stop-AndExit 0
+    Stop-AndExit 0 -Reason "所选操作已完成。日志保存在：$PSScriptRoot\LOG"
 }
 $script:LiveMode = ($script:TaskType -eq 'live')
 if ($script:LiveMode) {
@@ -1875,6 +1886,8 @@ if ($script:LiveMode) {
         Write-Output "      改动可能被系统自动改回（需要先在 Windows 安全中心手动关闭篡改防护）。"
     }
     Write-Output " "
+    # 与「制作 ISO」的最终确认一致：发生在真正开始施工之前，属参数/意图确认阶段，
+    # 图形界面下走弹窗，命令行下走问答。
     $confirm = $(if ($script:GuiMode) { $(if (Show-GuiConfirm "即将对【当前正在使用的系统】执行精简。`n`n此操作不可逆：脚本不会创建还原点、也不备份注册表，改动立即生效。`n`n确认开始吗？") { 'Y' } else { 'N' }) } else { Read-Host "确认对当前系统执行精简？(Y/N)（确认后一路自动执行到结束，中途不再需要按键）" })
     if ($confirm -notmatch '^[Yy]') {
         Write-Output "已取消，脚本退出。"
@@ -1889,7 +1902,7 @@ if (-not $script:LiveMode) {
     if (-not (Test-Path -Path "$PSScriptRoot/autounattend.xml")) {
         Write-Output "本地缺少 autounattend.xml，正在从本项目仓库下载..."
         try {
-            Invoke-RestMethod "https://raw.githubusercontent.com/skydark-litth/PS.tiny11builder/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml" -ErrorAction Stop
+            Invoke-RestMethod "https://raw.githubusercontent.com/skydark-litth/ps1.tiny11builder/main/autounattend.xml" -OutFile "$PSScriptRoot/autounattend.xml" -ErrorAction Stop
         } catch {
             Write-Output "下载 autounattend.xml 失败：$_"
             Write-Output "该文件负责跳过微软账号登录并创建本地账户，缺失会让做出来的镜像失去这些能力，因此不再继续。"
@@ -2076,8 +2089,10 @@ if (-not $script:LiveMode) {
     }
 
     # 最终确认。确认之后脚本不再打断，会一路自动执行到结束（含收尾清理）
+    # 这一确认发生在真正开始施工之前，仍属「参数/意图确认」阶段：图形界面下走弹窗，
+    # 命令行下走问答。（开始施工之后的提示、结果、异常才一律只用控制台。）
     Write-Output " "
-    $confirm = $(if ($script:GuiMode) { 'Y' } else { Read-Host "确认开始制作精简镜像？(Y/N)（确认后将一路自动执行到结束，中途不再需要按键）" })
+    $confirm = $(if ($script:GuiMode) { $(if (Show-GuiConfirm "确认开始制作精简镜像？`n`n确认后将一路自动执行到结束，中途不再需要按键。") { 'Y' } else { 'N' }) } else { Read-Host "确认开始制作精简镜像？(Y/N)（确认后将一路自动执行到结束，中途不再需要按键）" })
     if ($confirm -notmatch '^[Yy]') {
         Write-Output "已取消，脚本退出。"
         Stop-AndExit 0
@@ -3491,18 +3506,29 @@ if ($script:LiveMode) {
     Write-Output "建议重启一次，让服务禁用、组件存储清理等改动完全生效。"
 }
 
-#---------[ 完成提示（图形界面）]---------#
-# 用弹窗告知最终结果，用户不必去读控制台窗口。
-if ($script:GuiMode) {
-    if ($script:LiveMode) {
-        Show-GuiDone "精简已完成。`n`n建议重启一次，让服务禁用、组件存储清理等改动完全生效。`n`n日志保存在：`n$PSScriptRoot\LOG"
-    } else {
-        Show-GuiDone ("制作已完成。`n`n生成的 ISO 文件：`n{0}`n`n（刚才在窗口里装载的 ISO 仍处于装载状态，可在「此电脑」中右键它选择「弹出」）`n`n日志保存在：`n{1}\LOG" -f $isoOutputPath, $PSScriptRoot)
-    }
-}
-
-# 停止记录日志（并释放单实例锁）
+#---------[ 收尾：先释放单实例锁、结束日志，再打完成横幅 ]---------#
+# 顺序很关键：先把日志与锁收干净，最后才把结果打到控制台上。
+# Stop-Transcript 会由 PowerShell 自身在控制台上打印一行「已停止脚本，输出文件为 …」，
+# 这行无法被重定向或抑制（它不经 PowerShell 输出流），紧跟在「制作完成」之后容易被误读成
+# 「脚本异常停止」。因此停掉转录后立刻清屏并重打完成横幅，让用户看到的最后画面是明确的结果。
 Remove-RunningLock
-Stop-Transcript
+Stop-Transcript | Out-Null
+try { Clear-Host } catch { }
+if ($script:LiveMode) {
+    Write-ResultBanner -Color 'Green' -Lines @(
+        '精简已完成。',
+        '建议重启一次，让服务禁用、组件存储清理等改动完全生效。',
+        "日志保存在：$PSScriptRoot\LOG"
+    )
+} else {
+    Write-ResultBanner -Color 'Green' -Lines @(
+        '制作已完成。',
+        '生成的 ISO 文件：',
+        $isoOutputPath,
+        '',
+        '刚才在参数窗口里装载的 ISO 仍处于装载状态，可在「此电脑」中右键它选择「弹出」。',
+        "日志保存在：$PSScriptRoot\LOG"
+    )
+}
 
 exit
