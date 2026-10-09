@@ -3,7 +3,7 @@
     精简 Windows 11：制作精简 ISO / 精简当前系统 / 独立维护小工具（多模式中文版）。
 #>
 
-# 版本 3.4
+# 版本 3.5
 
 #---------[ 参数 ]---------#
 param (
@@ -198,8 +198,8 @@ function Test-RegKeyExists {
 
 function Remove-RegistryValue {
     param (
-		[string]$path
-	)
+        [string]$path
+    )
     if (Test-LiveSkipRegPath $path) {
         Write-Output "（活动系统：跳过只对 OOBE 有意义的项）$path"
         return
@@ -399,18 +399,25 @@ function Mount-RegistryHive {
 # TiWorker 是 Windows 模块安装程序的 worker，可能仍在消化上一轮的应用移除 —— 结束它正是
 # 「终结上一轮全部状态」的一部分（其未完成的工作本就随会话丢弃）。
 function Stop-LingeringDismWorkers {
+    # 统计实际结束掉的进程数。不要用「循环里的 $procs 变量在循环外判断」——
+    # PowerShell 里那是同一个变量，循环结束后只剩最后一轮（TiWorker）的值；
+    # 典型失效场景：系统里只有滞留的 wimserv（最常见），$procs 末轮为空 → 判定为「没杀过」
+    # → 跳过下面的等待 → 紧随的 reg unload / Dismount 撞在尚未释放的句柄上而失败。
+    $killed = 0
     foreach ($n in 'wimserv', 'DismHost', 'TiWorker') {
-        $procs = @(Get-Process -Name $n -ErrorAction SilentlyContinue)
-        foreach ($p in $procs) {
+        foreach ($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
             Write-Output "正在结束滞留的 $n（PID $($p.Id)）..."
             try {
                 Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                $killed++
             } catch {
                 Write-Output "结束失败：$_"
             }
         }
     }
-    if ($procs.Count -gt 0) { Start-Sleep -Seconds 3 }
+    # 只要真的结束过进程就等一下：进程对象虽已消失，内核与文件系统仍需要时间释放它持有的
+    # hive / WIM 文件句柄，否则紧随其后的 reg unload / Dismount-WindowsImage 会报共享冲突。
+    if ($killed -gt 0) { Start-Sleep -Seconds 3 }
 }
 
 function Dismount-RegistryHive {
@@ -1531,7 +1538,7 @@ function Restore-LocalWindowsUpdate {
 #---------[ 垃圾清理（选单 [3] 与精简流程共用）]---------#
 # 基准目录 Root：制作 ISO 时为挂载映像目录 $ScratchDir；精简本机时为系统盘（如 C:）。
 # 逐项执行、逐项计数；单项失败只累计不中止（沿用本工具「不因个别失败而中断」的一贯做法）。
-# 每一项的 Id 沿用 Dism++ 规则清单的编号（C01-C74），便于按编号核对与增减。
+# 每一项带一个 Id（清单内序号，J01 起）作为日志定位标签；Kind/Paths/Pattern 决定怎么删，
 
 # 从注册表读取字符串值（用于按注册表定位软件安装目录的清理项）。
 # 同样使用 reg.exe 而非注册表提供程序，避免在进程内残留 hive 句柄。
@@ -1545,7 +1552,41 @@ function Get-RegValueString {
     return $null
 }
 
-# 带日志的「按注册表定位清理目标」：C05-C12 这类项的目标目录是从注册表读出来的，
+# 读取 DWORD 值（十进制整数）。读不到（键/值不存在，或 reg 失败）返回 $null。
+function Get-RegValueDword {
+    param ([string]$path, [string]$name)
+    $target = Get-TargetRegPath $path
+    $s = Get-RegValueString $target $name
+    if ($null -eq $s) { return $null }
+    $n = 0
+    # reg query 对 DWORD 输出十六进制（0x...）；统一按 0x 前缀解析，失败则退回十进制。
+    if ($s -match '^0x([0-9a-fA-F]+)$') {
+        return [int64][Convert]::ToInt64($Matches[1], 16)
+    }
+    if ([int64]::TryParse($s, [ref]$n)) { return $n }
+    return $null
+}
+
+# 按位或写入 DWORD：Attributes |= mask。
+# 用途：ShellFolder\Attributes 这类「标志位集合」不能直接赋值（会把其它位清零），
+# 必须先读原值再 OR。原值不存在时按 0 起算（等价于直接写 mask）。
+function Set-RegistryValueOr {
+    param ([string]$path, [string]$name, [int64]$mask)
+    if (Test-LiveSkipRegPath $path) {
+        Write-Output "（活动系统：跳过只对 OOBE 有意义的项）$path\$name"
+        return
+    }
+    $cur = Get-RegValueDword $path $name
+    if ($null -eq $cur) { $cur = 0 }
+    $new = $cur -bor $mask
+    if ($cur -eq $new) {
+        Write-Output "注册表项已含目标位（跳过）：$(Get-TargetRegPath $path)\$name"
+        return
+    }
+    Set-RegistryValue $path $name 'REG_DWORD' ('0x{0:x}' -f $new)
+}
+
+# 带日志的「按注册表定位清理目标」：这类项的目标目录是从注册表读出来的，
 # 只报「清理 N 项」用户无法核对清的是哪个目录，因此把定位结果一并写进日志。
 function Get-JunkPathFromReg {
     param ([string]$Key, [string]$Name)
@@ -1615,20 +1656,53 @@ function Remove-JunkTarget {
     return @($removed, $failed)
 }
 
-# 需要专用命令或需要先定位路径的清理项
+# 需要专用命令或需要先按注册表定位路径的清理项。
+# 分派依据是清单里的 Action 标签（不是序号）—— 以后增删条目或调整顺序都不必回来改这里。
 function Invoke-SpecialJunk {
-    param ([string]$Root, [string]$Id)
+    param ([string]$Root, [string]$Action)
     $removed = 0; $failed = 0
-    switch ($Id) {
-        'C05' { $k = 'HKLM\SOFTWARE\Alibaba\WWLights\EE76A38A6C9E01F42C551FE3BE585C3B'; $p = Get-JunkPathFromReg $k 'Path'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*'); $removed += $r[0]; $failed += $r[1] } }
-        'C06' { $k = 'HKLM\SOFTWARE\Alibaba\WWLights\810588CDA60249EB05C110B0DED77CD8'; $p = Get-JunkPathFromReg $k 'Path'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*'); $removed += $r[0]; $failed += $r[1] } }
-        'C07' { foreach ($k in @('HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe', 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe')) { $p = Get-JunkPathFromReg $k 'Path'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] } } }
-        'C08' { foreach ($k in @('HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\opera.exe', 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\opera.exe')) { $p = Get-JunkPathFromReg $k 'Path'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] } } }
-        'C09' { $p = Get-JunkPathFromReg 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\PPLive.exe' 'Path'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] } }
-        'C10' { $p = Get-JunkPathFromReg 'HKCU\Software\kugou' 'AppPath'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] } }
-        'C11' { $p = Get-JunkPathFromReg 'HKLM\SOFTWARE\2345Pinyin' 'Path'; if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] } }
-        'C12' { $p = Get-JunkPathFromReg 'HKCU\SOFTWARE\kingsoft\office\6.0\Common' 'InstallRoot'; if ($p) { $p = Split-Path $p -Parent; $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] } }
-        'C17' {
+    switch ($Action) {
+        # —— 按注册表定位安装目录，再清其下的旧版本备份目录 ——
+        'alibaba-ww' {
+            $k = 'HKLM\SOFTWARE\Alibaba\WWLights\EE76A38A6C9E01F42C551FE3BE585C3B'
+            $p = Get-JunkPathFromReg $k 'Path'
+            if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*'); $removed += $r[0]; $failed += $r[1] }
+        }
+        'alibaba-qt' {
+            $k = 'HKLM\SOFTWARE\Alibaba\WWLights\810588CDA60249EB05C110B0DED77CD8'
+            $p = Get-JunkPathFromReg $k 'Path'
+            if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*'); $removed += $r[0]; $failed += $r[1] }
+        }
+        'chrome' {
+            foreach ($k in @('HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe', 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe')) {
+                $p = Get-JunkPathFromReg $k 'Path'
+                if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] }
+            }
+        }
+        'opera' {
+            foreach ($k in @('HKCU\Software\Microsoft\Windows\CurrentVersion\App Paths\opera.exe', 'HKLM\Software\Microsoft\Windows\CurrentVersion\App Paths\opera.exe')) {
+                $p = Get-JunkPathFromReg $k 'Path'
+                if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] }
+            }
+        }
+        'pplive' {
+            $p = Get-JunkPathFromReg 'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\PPLive.exe' 'Path'
+            if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] }
+        }
+        'kugou' {
+            $p = Get-JunkPathFromReg 'HKCU\Software\kugou' 'AppPath'
+            if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] }
+        }
+        '2345pinyin' {
+            $p = Get-JunkPathFromReg 'HKLM\SOFTWARE\2345Pinyin' 'Path'
+            if ($p) { $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] }
+        }
+        'wps' {
+            $p = Get-JunkPathFromReg 'HKCU\SOFTWARE\kingsoft\office\6.0\Common' 'InstallRoot'
+            if ($p) { $p = Split-Path $p -Parent; $r = Remove-JunkTarget $Root ($p -replace [regex]::Escape($env:SystemDrive), '') 'childdirs' @('*.*.*.*'); $removed += $r[0]; $failed += $r[1] }
+        }
+        # —— 需要专用命令 ——
+        'eventlog' {
             # 事件日志属于运行中的系统：制作 ISO 时镜像里没有日志可清，直接跳过，
             # 否则 wevtutil 会去清宿主机的日志（与目标镜像无关的破坏）。
             if (-not $script:LiveMode) { return @(0, 0) }
@@ -1639,14 +1713,14 @@ function Invoke-SpecialJunk {
                 if ($LASTEXITCODE -eq 0) { $removed++ } else { $failed++ }
             }
         }
-        'C18' {
-            # 清空「更新安装记录」：清 SoftwareDistribution\DataStore 内容（等效于 Dism++ 的更新历史清理）
+        'wudatastore' {
+            # 清空「更新安装记录」：清 SoftwareDistribution\DataStore 内容
             if ($script:LiveMode) { Stop-Service -Name 'wuauserv' -Force -ErrorAction SilentlyContinue }
             $r = Remove-JunkTarget $Root (Join-Path 'Windows\SoftwareDistribution' 'DataStore') 'contents' @(); $removed += $r[0]; $failed += $r[1]
             if ($script:LiveMode) { Start-Service -Name 'wuauserv' -ErrorAction SilentlyContinue }
         }
-        'C19' {
-            # Installer 目录：删除未被「已注册补丁」引用的 .msp（等效于规则的「被取代的 msp」判定）
+        'installer-msp' {
+            # Installer 目录：删除未被「已注册补丁」引用的 .msp
             $referenced = @{}
             $patchOut = & 'reg' 'query' 'HKLM\SOFTWARE\Classes\Installer\Patches' '/s' 2>&1
             foreach ($line in $patchOut) { if ($line -match '(.+?\.msp)\s*$') { $referenced[$Matches[1].ToLower()] = $true } }
@@ -1658,12 +1732,12 @@ function Invoke-SpecialJunk {
                 }
             }
         }
-        'C27' {
+        'wudownload' {
             if ($script:LiveMode) { Stop-Service -Name 'wuauserv' -Force -ErrorAction SilentlyContinue }
             $r = Remove-JunkTarget $Root 'Windows\SoftwareDistribution\Download' 'contents' @(); $removed += $r[0]; $failed += $r[1]
             if ($script:LiveMode) { Start-Service -Name 'wuauserv' -ErrorAction SilentlyContinue }
         }
-        'C28' {
+        'delivery-opt' {
             if ($script:LiveMode -and (Get-Command 'Delete-DeliveryOptimizationCache' -ErrorAction SilentlyContinue)) {
                 try { Delete-DeliveryOptimizationCache -Force -ErrorAction Stop; $removed++ } catch { $failed++ }
             } else {
@@ -1672,79 +1746,80 @@ function Invoke-SpecialJunk {
                 }
             }
         }
-        'C36' { if ($script:LiveMode) { & 'RunDll32' 'InetCpl.cpl,ClearMyTracksByProcess' '8' | Out-Null; $removed++ } }
-        'C37' { if ($script:LiveMode) { & 'RunDll32' 'InetCpl.cpl,ClearMyTracksByProcess' '2' | Out-Null; $removed++ } }
-        'C68' { if ($script:LiveMode) { try { Clear-RecycleBin -Force -ErrorAction Stop; $removed++ } catch { $failed++ } } }
-        'C72' { $r = Remove-JunkTarget $Root 'Users\*\AppData\Roaming\IDM\DwnlData' 'tree' @(); $removed += $r[0]; $failed += $r[1] }
+        'wininet-cache'  { if ($script:LiveMode) { & 'RunDll32' 'InetCpl.cpl,ClearMyTracksByProcess' '8' | Out-Null; $removed++ } }
+        'wininet-cookie' { if ($script:LiveMode) { & 'RunDll32' 'InetCpl.cpl,ClearMyTracksByProcess' '2' | Out-Null; $removed++ } }
+        'recyclebin'     { if ($script:LiveMode) { try { Clear-RecycleBin -Force -ErrorAction Stop; $removed++ } catch { $failed++ } } }
     }
     return @($removed, $failed)
 }
 
-# 62 项清理目标：Id 沿用 Dism++ 规则清单编号（C01-C74）
+# 清理清单：Id 只用作日志里的定位标签，与任何外部工具的编号无关。顺序即编号递进。
+# 条目顺序按「系统级大件 → 缓存/日志 → 第三方软件 → 专项」排列。
+# Kind=special 的条目由 Invoke-SpecialJunk 按 Action 标签分派（需要专用命令或先按注册表定位）。
 $script:JunkItems = @(
-    @{ Id = 'C02'; Name = '以前的Windows系统'; Kind = 'tree'; Paths = @('Windows.old') },
-    @{ Id = 'C04'; Name = '360浏览器老版本备份'; Kind = 'childdirs'; Paths = @('Users\*\AppData\Roaming\360se6\Application'); Pattern = @('*.*.*.*') },
-    @{ Id = 'C16'; Name = 'Windows报告'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\Windows\WER\ReportQueue', 'ProgramData\Microsoft\Windows\WER\ReportArchive', 'ProgramData\Microsoft\Windows\WER\ReportHistory', 'Users\*\AppData\Local\Microsoft\Windows\WER') },
-    @{ Id = 'C22'; Name = '零售演示离线内容'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\Windows\RetailDemo') },
-    @{ Id = 'C25'; Name = 'Installer基线缓存'; Kind = 'tree'; Paths = @('Windows\Installer\$PatchCache$') },
-    @{ Id = 'C26'; Name = 'NuGet包缓存'; Kind = 'tree'; Paths = @('Users\*\.nuget', 'Users\*\AppData\Local\NuGet\v3-cache') },
-    @{ Id = 'C29'; Name = 'Terminal Server Client缓存'; Kind = 'contents'; Paths = @('Users\*\AppData\Local\Microsoft\Terminal Server Client\Cache') },
-    @{ Id = 'C30'; Name = 'XDE缓存文件'; Kind = 'tree'; Paths = @('ProgramData\Microsoft\XDE') },
-    @{ Id = 'C31'; Name = 'PDB缓存文件'; Kind = 'tree'; Paths = @('Users\*\AppData\Local\DBG') },
-    @{ Id = 'C32'; Name = 'NET程序集缓存'; Kind = 'contents'; Paths = @('Windows\assembly\NativeImages_v*') },
-    @{ Id = 'C33'; Name = 'Visual Studio智能跟踪'; Kind = 'tree'; Paths = @('ProgramData\Microsoft Visual Studio\10.0\TraceDebugging') },
-    @{ Id = 'C34'; Name = 'Windows预读取文件'; Kind = 'files'; Paths = @('Windows\Prefetch'); Pattern = @('*.pf') },
-    @{ Id = 'C35'; Name = '缩略图缓存'; Kind = 'files'; Paths = @('Users\*\AppData\Local\Microsoft\Windows\Explorer'); Pattern = @('thumbcache_*.db', 'iconcache_*.db') },
-    @{ Id = 'C38'; Name = 'Appx缓存文件'; Kind = 'contents'; Paths = @('Users\*\AppData\Local\Packages\*\AC', 'Users\*\AppData\Local\Packages\*\LocalCache', 'Users\*\AppData\Local\Packages\*\TempState') },
-    @{ Id = 'C39'; Name = '瑞昱声卡驱动安装源缓存'; Kind = 'contents'; Paths = @('Program Files\Realtek\Audio') },
-    @{ Id = 'C40'; Name = 'Java安装源缓存'; Kind = 'childdirs'; Paths = @('Users\*\AppData\Roaming\Oracle\Java'); Pattern = @('jre*', 'installcache', 'tmpinstall') },
-    @{ Id = 'C41'; Name = 'Intel驱动安装源缓存'; Kind = 'tree'; Paths = @('ProgramData\Intel\Package Cache') },
-    @{ Id = 'C42'; Name = '英伟达驱动安装源缓存'; Kind = 'contents'; Paths = @('Program Files\NVIDIA Corporation\Installer2') },
-    @{ Id = 'C43'; Name = 'SQL Server更新缓存'; Kind = 'childdirs'; Paths = @('Program Files\Microsoft SQL Server\*\Setup Bootstrap', 'Program Files (x86)\Microsoft SQL Server\*\Setup Bootstrap', 'Program Files\Microsoft SQL Server\*\Setup Bootstrap\Log', 'Program Files (x86)\Microsoft SQL Server\*\Setup Bootstrap\Log'); Pattern = @('Update Cache', 'SQLServer2008R2') },
-    @{ Id = 'C44'; Name = 'Adobe Acrobat安装源缓存'; Kind = 'tree'; Paths = @('Program Files (x86)\Adobe\Acrobat DC\Setup Files') },
-    @{ Id = 'C45'; Name = '.NET安装缓存'; Kind = 'tree'; Paths = @('Program Files\Microsoft.NET\Multi-Targeting Pack\*\SetupCache', 'Program Files (x86)\Microsoft.NET\Multi-Targeting Pack\*\SetupCache') },
-    @{ Id = 'C46'; Name = 'Package Cache目录'; Kind = 'contents'; Paths = @('ProgramData\Package Cache') },
-    @{ Id = 'C47'; Name = 'Defender保护历史记录'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\Windows Defender\Scans\History') },
-    @{ Id = 'C48'; Name = 'WebPI缓存'; Kind = 'tree'; Paths = @('Users\*\AppData\Local\Microsoft\Web Platform Installer') },
-    @{ Id = 'C49'; Name = 'Visual Studio安装源缓存'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\VisualStudio\Packages') },
-    @{ Id = 'C50'; Name = 'Office安装源'; Kind = 'tree'; Paths = @('MSOCache') },
-    @{ Id = 'C51'; Name = 'Office 365/2016安装源'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\ClickToRun') },
-    @{ Id = 'C53'; Name = 'Boot备份信息'; Kind = 'tree'; Paths = @('Windows\pss') },
-    @{ Id = 'C56'; Name = '最后一次正确配置'; Kind = 'tree'; Paths = @('Windows\lastgood', 'Windows\lastgood.tmp') },
-    @{ Id = 'C57'; Name = 'WinSxS临时文件'; Kind = 'contents'; Paths = @('Windows\WinSxS\Temp') },
-    @{ Id = 'C58'; Name = 'Windows日志'; Kind = 'files'; Paths = @('Windows', 'Windows\Performance\WinSAT', 'Windows\Panther', 'Users\*\AppData\Local\Microsoft\Windows', 'Users\*\AppData\Roaming\Microsoft\Windows', 'Users\*\AppData\Local\MigWiz'); Pattern = @('*.log', '*.bak', '*log.txt', 'SchedLgU.txt') },
-    @{ Id = 'C59'; Name = '临时文件'; Kind = 'contents'; Paths = @('Windows\Temp', 'Users\*\AppData\Local\Temp') },
-    @{ Id = 'C60'; Name = '常见的驱动临时解压目录'; Kind = 'tree'; Paths = @('AMD', 'Intel', 'NVIDIA', 'Prog') },
-    @{ Id = 'C61'; Name = 'Windows临时安装文件'; Kind = 'tree'; Paths = @('$Windows.~BT', '$Windows.~WS', '$Windows.~LS') },
-    @{ Id = 'C62'; Name = 'QQ临时数据'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\Tencent\AndroidAssist', 'Users\*\AppData\Roaming\Tencent\AndroidServer', 'Users\*\AppData\Roaming\Tencent\Logs', 'Users\*\AppData\Roaming\Tencent\TXSSO\SetupLogs', 'Users\*\AppData\Roaming\Tencent\TXSSO\SSOTemp') },
-    @{ Id = 'C63'; Name = 'YY临时文件'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\duowan\yy\log', 'Users\*\AppData\Roaming\duowan\yy\Cache') },
-    @{ Id = 'C64'; Name = '腾讯相关软件下载目录'; Kind = 'tree'; Paths = @('ProgramData\temp') },
-    @{ Id = 'C65'; Name = '微软拼音安装文件'; Kind = 'tree'; Paths = @('Users\*\AppData\LocalLow\KunlunInput') },
-    @{ Id = 'C66'; Name = '百度网盘日志'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\BaiduYunKernel\Data', 'Users\*\AppData\Roaming\BaiduYunGuanjia\logs') },
-    @{ Id = 'C67'; Name = '飞信日志'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\FetionV5') },
-    @{ Id = 'C69'; Name = '崩溃dmp文件'; Kind = 'files'; Paths = @('Windows'); Pattern = @('MEMORY.DMP') },
-    @{ Id = 'C69'; Name = '崩溃dmp文件（Minidump/CrashDumps）'; Kind = 'tree'; Paths = @('Windows\Minidump', 'Users\*\AppData\Local\CrashDumps') },
-    @{ Id = 'C70'; Name = '微软系安软无用文件'; Kind = 'files'; Paths = @('ProgramData\Microsoft\Windows Defender\Support', 'ProgramData\Microsoft\Microsoft Antimalware\Support'); Pattern = @('*.log', '*.etl') },
-    @{ Id = 'C71'; Name = 'Visual Studio日志'; Kind = 'files'; Paths = @('ProgramData\Microsoft\VisualStudio'); Pattern = @('*.log') },
-    @{ Id = 'C73'; Name = '英伟达驱动安装包'; Kind = 'tree'; Paths = @('ProgramData\NVIDIA Corporation\Downloader') },
-    @{ Id = 'C74'; Name = '小红伞临时文件'; Kind = 'childdirs'; Paths = @('ProgramData\Avira\*'); Pattern = @('TEMP', 'BACKUP') },
-    @{ Id = 'C05'; Name = '阿里旺旺老版本备份'; Kind = 'special' },
-    @{ Id = 'C06'; Name = '阿里亲淘老版本备份'; Kind = 'special' },
-    @{ Id = 'C07'; Name = 'Chrome老版本备份'; Kind = 'special' },
-    @{ Id = 'C08'; Name = 'Opera老版本备份'; Kind = 'special' },
-    @{ Id = 'C09'; Name = 'PPLive老版本备份'; Kind = 'special' },
-    @{ Id = 'C10'; Name = '酷狗音乐老版本备份'; Kind = 'special' },
-    @{ Id = 'C11'; Name = '2345拼音输入法老版本备份'; Kind = 'special' },
-    @{ Id = 'C12'; Name = 'WPS老版本备份'; Kind = 'special' },
-    @{ Id = 'C17'; Name = 'Windows事件'; Kind = 'special' },
-    @{ Id = 'C18'; Name = 'Windows更新安装记录'; Kind = 'special' },
-    @{ Id = 'C19'; Name = 'Installer目录'; Kind = 'special' },
-    @{ Id = 'C27'; Name = 'Windows下载缓存'; Kind = 'special' },
-    @{ Id = 'C28'; Name = '传递优化缓存'; Kind = 'special' },
-    @{ Id = 'C36'; Name = 'WinINet网页缓存'; Kind = 'special' },
-    @{ Id = 'C37'; Name = 'WinINet Cookies'; Kind = 'special' },
-    @{ Id = 'C68'; Name = '回收站'; Kind = 'special' },
-    @{ Id = 'C72'; Name = 'IDM临时文件'; Kind = 'special' }
+    @{ Id = 'J01'; Name = '以前的Windows系统'; Kind = 'tree'; Paths = @('Windows.old') },
+    @{ Id = 'J02'; Name = 'Windows临时安装文件'; Kind = 'tree'; Paths = @('$Windows.~BT', '$Windows.~WS', '$Windows.~LS') },
+    @{ Id = 'J03'; Name = 'Installer基线缓存'; Kind = 'tree'; Paths = @('Windows\Installer\$PatchCache$') },
+    @{ Id = 'J04'; Name = '最后一次正确配置'; Kind = 'tree'; Paths = @('Windows\lastgood', 'Windows\lastgood.tmp') },
+    @{ Id = 'J05'; Name = 'Boot备份信息'; Kind = 'tree'; Paths = @('Windows\pss') },
+    @{ Id = 'J06'; Name = '崩溃转储文件'; Kind = 'files'; Paths = @('Windows'); Pattern = @('MEMORY.DMP') },
+    @{ Id = 'J07'; Name = '崩溃转储文件（小型转储）'; Kind = 'tree'; Paths = @('Windows\Minidump', 'Users\*\AppData\Local\CrashDumps') },
+    @{ Id = 'J08'; Name = 'WinSxS临时文件'; Kind = 'contents'; Paths = @('Windows\WinSxS\Temp') },
+    @{ Id = 'J09'; Name = '临时文件'; Kind = 'contents'; Paths = @('Windows\Temp', 'Users\*\AppData\Local\Temp') },
+    @{ Id = 'J10'; Name = 'Windows日志'; Kind = 'files'; Paths = @('Windows', 'Windows\Performance\WinSAT', 'Windows\Panther', 'Users\*\AppData\Local\Microsoft\Windows', 'Users\*\AppData\Roaming\Microsoft\Windows', 'Users\*\AppData\Local\MigWiz'); Pattern = @('*.log', '*.bak', '*log.txt', 'SchedLgU.txt') },
+    @{ Id = 'J11'; Name = 'Windows预读取文件'; Kind = 'files'; Paths = @('Windows\Prefetch'); Pattern = @('*.pf') },
+    @{ Id = 'J12'; Name = '缩略图与图标缓存'; Kind = 'files'; Paths = @('Users\*\AppData\Local\Microsoft\Windows\Explorer'); Pattern = @('thumbcache_*.db', 'iconcache_*.db') },
+    @{ Id = 'J13'; Name = 'Windows报告'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\Windows\WER\ReportQueue', 'ProgramData\Microsoft\Windows\WER\ReportArchive', 'ProgramData\Microsoft\Windows\WER\ReportHistory', 'Users\*\AppData\Local\Microsoft\Windows\WER') },
+    @{ Id = 'J14'; Name = 'Package Cache目录'; Kind = 'contents'; Paths = @('ProgramData\Package Cache') },
+    @{ Id = 'J15'; Name = 'Appx缓存文件'; Kind = 'contents'; Paths = @('Users\*\AppData\Local\Packages\*\AC', 'Users\*\AppData\Local\Packages\*\LocalCache', 'Users\*\AppData\Local\Packages\*\TempState') },
+    @{ Id = 'J16'; Name = 'NET程序集缓存'; Kind = 'contents'; Paths = @('Windows\assembly\NativeImages_v*') },
+    @{ Id = 'J17'; Name = '零售演示离线内容'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\Windows\RetailDemo') },
+    @{ Id = 'J18'; Name = 'Defender保护历史记录'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\Windows Defender\Scans\History') },
+    @{ Id = 'J19'; Name = '微软系安软无用文件'; Kind = 'files'; Paths = @('ProgramData\Microsoft\Windows Defender\Support', 'ProgramData\Microsoft\Microsoft Antimalware\Support'); Pattern = @('*.log', '*.etl') },
+    @{ Id = 'J20'; Name = 'Terminal Server Client缓存'; Kind = 'contents'; Paths = @('Users\*\AppData\Local\Microsoft\Terminal Server Client\Cache') },
+    @{ Id = 'J21'; Name = '常见的驱动临时解压目录'; Kind = 'tree'; Paths = @('AMD', 'Intel', 'NVIDIA', 'Prog') },
+    @{ Id = 'J22'; Name = 'NuGet包缓存'; Kind = 'tree'; Paths = @('Users\*\.nuget', 'Users\*\AppData\Local\NuGet\v3-cache') },
+    @{ Id = 'J23'; Name = 'XDE缓存文件'; Kind = 'tree'; Paths = @('ProgramData\Microsoft\XDE') },
+    @{ Id = 'J24'; Name = 'PDB缓存文件'; Kind = 'tree'; Paths = @('Users\*\AppData\Local\DBG') },
+    @{ Id = 'J25'; Name = 'WebPI缓存'; Kind = 'tree'; Paths = @('Users\*\AppData\Local\Microsoft\Web Platform Installer') },
+    @{ Id = 'J26'; Name = 'Visual Studio智能跟踪'; Kind = 'tree'; Paths = @('ProgramData\Microsoft Visual Studio\10.0\TraceDebugging') },
+    @{ Id = 'J27'; Name = 'Visual Studio安装源缓存'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\VisualStudio\Packages') },
+    @{ Id = 'J28'; Name = 'Visual Studio日志'; Kind = 'files'; Paths = @('ProgramData\Microsoft\VisualStudio'); Pattern = @('*.log') },
+    @{ Id = 'J29'; Name = '瑞昱声卡驱动安装源缓存'; Kind = 'contents'; Paths = @('Program Files\Realtek\Audio') },
+    @{ Id = 'J30'; Name = 'Intel驱动安装源缓存'; Kind = 'tree'; Paths = @('ProgramData\Intel\Package Cache') },
+    @{ Id = 'J31'; Name = '英伟达驱动安装源缓存'; Kind = 'contents'; Paths = @('Program Files\NVIDIA Corporation\Installer2') },
+    @{ Id = 'J32'; Name = '英伟达驱动安装包'; Kind = 'tree'; Paths = @('ProgramData\NVIDIA Corporation\Downloader') },
+    @{ Id = 'J33'; Name = '.NET安装缓存'; Kind = 'tree'; Paths = @('Program Files\Microsoft.NET\Multi-Targeting Pack\*\SetupCache', 'Program Files (x86)\Microsoft.NET\Multi-Targeting Pack\*\SetupCache') },
+    @{ Id = 'J34'; Name = 'Adobe Acrobat安装源缓存'; Kind = 'tree'; Paths = @('Program Files (x86)\Adobe\Acrobat DC\Setup Files') },
+    @{ Id = 'J35'; Name = 'SQL Server更新缓存'; Kind = 'childdirs'; Paths = @('Program Files\Microsoft SQL Server\*\Setup Bootstrap', 'Program Files (x86)\Microsoft SQL Server\*\Setup Bootstrap', 'Program Files\Microsoft SQL Server\*\Setup Bootstrap\Log', 'Program Files (x86)\Microsoft SQL Server\*\Setup Bootstrap\Log'); Pattern = @('Update Cache', 'SQLServer2008R2') },
+    @{ Id = 'J36'; Name = 'Office安装源'; Kind = 'tree'; Paths = @('MSOCache') },
+    @{ Id = 'J37'; Name = 'Office 365/2016安装源'; Kind = 'contents'; Paths = @('ProgramData\Microsoft\ClickToRun') },
+    @{ Id = 'J38'; Name = 'Java安装源缓存'; Kind = 'childdirs'; Paths = @('Users\*\AppData\Roaming\Oracle\Java'); Pattern = @('jre*', 'installcache', 'tmpinstall') },
+    @{ Id = 'J39'; Name = '微软拼音安装文件'; Kind = 'tree'; Paths = @('Users\*\AppData\LocalLow\KunlunInput') },
+    @{ Id = 'J40'; Name = 'QQ临时数据'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\Tencent\AndroidAssist', 'Users\*\AppData\Roaming\Tencent\AndroidServer', 'Users\*\AppData\Roaming\Tencent\Logs', 'Users\*\AppData\Roaming\Tencent\TXSSO\SetupLogs', 'Users\*\AppData\Roaming\Tencent\TXSSO\SSOTemp') },
+    @{ Id = 'J41'; Name = '腾讯相关软件下载目录'; Kind = 'tree'; Paths = @('ProgramData\temp') },
+    @{ Id = 'J42'; Name = 'YY临时文件'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\duowan\yy\log', 'Users\*\AppData\Roaming\duowan\yy\Cache') },
+    @{ Id = 'J43'; Name = '百度网盘日志'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\BaiduYunKernel\Data', 'Users\*\AppData\Roaming\BaiduYunGuanjia\logs') },
+    @{ Id = 'J44'; Name = '飞信日志'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\FetionV5') },
+    @{ Id = 'J45'; Name = 'IDM临时文件'; Kind = 'tree'; Paths = @('Users\*\AppData\Roaming\IDM\DwnlData') },
+    @{ Id = 'J46'; Name = '360浏览器老版本备份'; Kind = 'childdirs'; Paths = @('Users\*\AppData\Roaming\360se6\Application'); Pattern = @('*.*.*.*') },
+    @{ Id = 'J47'; Name = '小红伞临时文件'; Kind = 'childdirs'; Paths = @('ProgramData\Avira\*'); Pattern = @('TEMP', 'BACKUP') },
+    @{ Id = 'J48'; Name = '阿里旺旺老版本备份'; Kind = 'special'; Action = 'alibaba-ww' },
+    @{ Id = 'J49'; Name = '阿里亲淘老版本备份'; Kind = 'special'; Action = 'alibaba-qt' },
+    @{ Id = 'J50'; Name = 'Chrome老版本备份'; Kind = 'special'; Action = 'chrome' },
+    @{ Id = 'J51'; Name = 'Opera老版本备份'; Kind = 'special'; Action = 'opera' },
+    @{ Id = 'J52'; Name = 'PPLive老版本备份'; Kind = 'special'; Action = 'pplive' },
+    @{ Id = 'J53'; Name = '酷狗音乐老版本备份'; Kind = 'special'; Action = 'kugou' },
+    @{ Id = 'J54'; Name = '2345拼音输入法老版本备份'; Kind = 'special'; Action = '2345pinyin' },
+    @{ Id = 'J55'; Name = 'WPS老版本备份'; Kind = 'special'; Action = 'wps' },
+    @{ Id = 'J56'; Name = 'Windows事件日志'; Kind = 'special'; Action = 'eventlog' },
+    @{ Id = 'J57'; Name = 'Windows更新安装记录'; Kind = 'special'; Action = 'wudatastore' },
+    @{ Id = 'J58'; Name = 'Installer目录（被取代的补丁）'; Kind = 'special'; Action = 'installer-msp' },
+    @{ Id = 'J59'; Name = 'Windows下载缓存'; Kind = 'special'; Action = 'wudownload' },
+    @{ Id = 'J60'; Name = '传递优化缓存'; Kind = 'special'; Action = 'delivery-opt' },
+    @{ Id = 'J61'; Name = 'WinINet网页缓存'; Kind = 'special'; Action = 'wininet-cache' },
+    @{ Id = 'J62'; Name = 'WinINet Cookies'; Kind = 'special'; Action = 'wininet-cookie' },
+    @{ Id = 'J63'; Name = '回收站'; Kind = 'special'; Action = 'recyclebin' }
 )
 
 function Invoke-JunkCleanup {
@@ -1758,7 +1833,7 @@ function Invoke-JunkCleanup {
     foreach ($item in $script:JunkItems) {
         $removed = 0; $failed = 0
         if ($item.Kind -eq 'special') {
-            $r = Invoke-SpecialJunk $Root $item.Id
+            $r = Invoke-SpecialJunk $Root $item.Action
             $removed = $r[0]; $failed = $r[1]
         } else {
             foreach ($rel in $item.Paths) {
@@ -2154,10 +2229,17 @@ if (-not $script:LiveMode) {
     }
 
     $imageIntl = & dism /English /Get-Intl "/Image:$ScratchDir"
-    $languageLine = $imageIntl -split '\n' | Where-Object { $_ -match 'Default system UI language : ([a-zA-Z]{2}-[a-zA-Z]{2})' }
-
-    if ($languageLine) {
-        $languageCode = $Matches[1]
+    # 逐个匹配并就地取出语言代码：不能写成「先 Where-Object -match 落变量，再用 $Matches[1]」——
+    # $Matches 是全局自动变量，中间只要出现任何其它 -match 就会被覆盖，届时 $languageCode 静默变空，
+    # ISO 文件名会悄悄退回 multi 前缀（不报错，只出错）。这里把取值放在判断的当场，消除该隐患。
+    $languageCode = ''
+    foreach ($intlLine in @($imageIntl -split '\r?\n')) {
+        if ($intlLine -match 'Default system UI language\s*:\s*([a-zA-Z]{2}-[a-zA-Z]{2})') {
+            $languageCode = $Matches[1]
+            break
+        }
+    }
+    if ($languageCode) {
         Write-Output "默认系统界面语言代码：$languageCode"
     } else {
         Write-Output "未找到默认系统界面语言代码。"
@@ -2860,7 +2942,9 @@ Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableF
 # O034 关闭多嘴的小娜（by 朽木）
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\Windows\Windows Search' 'AllowCortana' 'REG_DWORD' '0'
 # O075 隐藏资源管理器导航窗口中的OneDrive（by 莫失莫忘）
-Set-RegistryValue 'HKLM\zSOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}\ShellFolder' 'Attributes' 'REG_DWORD' '0x100000'
+# Attributes 是标志位集合，原规则用「按位或」置位（Attributes |= 0x100000），
+# 直接赋值会把该 CLSID 上其它 ShellFolder 行为位清零，故走 OR 助手。
+Set-RegistryValueOr 'HKLM\zSOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}\ShellFolder' 'Attributes' 0x100000
 # O102 关闭Adobe Flash即点即用
 Set-RegistryValue 'HKLM\zSOFTWARE\Policies\Microsoft\MicrosoftEdge\Security' 'FlashClickToRunMode' 'REG_DWORD' '0'
 # O133 *关闭默认共享（by 518516.net）
@@ -2931,7 +3015,9 @@ Set-UserRegistryValue 'HKLM\zNTUSER\Control Panel\Desktop' 'JPEGImportQuality' '
 Set-UserRegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SystemPaneSuggestionsEnabled' 'REG_DWORD' '0'
 # O024 不允许在开始菜单显示建议（by powerxing04）
 Set-UserRegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SubscribedContent-338388Enabled' 'REG_DWORD' '0'
-Set-UserRegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SubscribedContent-338389Enabled' 'REG_DWORD' '1'
+# 338389 = 「使用 Windows 时获取提示、技巧和建议」。Dism++ 原规则在 O024 下把它置 1（保持 Tips 开启），
+# 但本工具的意图是关闭推广，故这里置 0 与 §一「禁用赞助应用」段保持一致（原段已是 0，此处属重复兜底）。
+Set-UserRegistryValue 'HKLM\zNTUSER\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'SubscribedContent-338389Enabled' 'REG_DWORD' '0'
 # O026 关闭商店应用推广（by 、Cloud.）
 Set-UserRegistryValue 'HKLM\zNTUSER\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' 'PreInstalledAppsEnabled' 'REG_DWORD' '0'
 # O027 关闭锁屏时的Windows 聚焦推广（by 、Cloud.）
