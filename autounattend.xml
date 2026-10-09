@@ -3,8 +3,44 @@
     <settings pass="oobeSystem">
         <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
             <OOBE>
+                <HideEULAPage>true</HideEULAPage>
                 <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <ProtectYourPC>3</ProtectYourPC>
             </OOBE>
+            <UserAccounts>
+                <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                        <Name>user</Name>
+                        <DisplayName>user</DisplayName>
+                        <Group>Administrators;Power Users</Group>
+                        <Password>
+                            <Value>UABhAHMAcwB3AG8AcgBkAA==</Value>
+                            <PlainText>false</PlainText>
+                        </Password>
+                    </LocalAccount>
+                </LocalAccounts>
+            </UserAccounts>
+            <!-- 首登改密必须放在 oobeSystem 的 FirstLogonCommands 里。
+                 不能放在 specialize 的 RunSynchronous：本地账户由本段（oobeSystem，第 7 pass）的
+                 <LocalAccounts> 创建，而 specialize（第 4 pass）更早执行，那时账号还不存在，
+                 net user "user" 会以「找不到用户」失败，进而使预约的配置阶段出错、安装失败。 -->
+            <FirstLogonCommands>
+                <SynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <CommandLine>net user "user" /logonpasswordchg:yes</CommandLine>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <Order>2</Order>
+                    <CommandLine>net accounts /maxpwage:unlimited</CommandLine>
+                </SynchronousCommand>
+                <!-- 首登卸载「入门」（Get Started）：部分镜像（26H2 实测）不把它列入预置包，
+                     DISM 的预置包移除覆盖不到，只能装好后按用户卸载。包不在时命令自动无害跳过。 -->
+                <SynchronousCommand wcm:action="add">
+                    <Order>3</Order>
+                    <CommandLine>powershell.exe -NoProfile -WindowStyle Hidden -Command "Get-AppxPackage Microsoft.Getstarted | Remove-AppxPackage"</CommandLine>
+                </SynchronousCommand>
+            </FirstLogonCommands>
         </component>
     </settings>
     <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">

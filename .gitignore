@@ -1,0 +1,11 @@
+# 运行时产物 / 临时目录
+oscdimg.exe
+*.iso
+*.log
+LOG/
+temp/
+tiny11/
+scratchdir/
+
+# 本地备份
+*.bak
