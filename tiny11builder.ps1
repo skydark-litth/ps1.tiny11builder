@@ -3,6 +3,9 @@
     精简 Windows 11：制作精简 ISO / 精简当前系统 / 独立维护小工具（多模式中文版）。
 #>
 
+#---------[ 版本（作者自查用，不在界面与日志中显示）]---------#
+# 当前版本：3.2
+# 记录规则：小更新 +0.1，大更新 +1.0。
 
 #---------[ 参数 ]---------#
 param (
@@ -936,6 +939,8 @@ function New-GuiDetailForm {
         $my += 26
     }
     $modeRadios[0].Checked = $true
+    # 事件处理器里要用，必须挂到 $script: 作用域（跨作用域引用函数内局部变量不可靠）
+    $script:GuiDlgModeRadios = $modeRadios
 
     $y = 126
 
@@ -1078,35 +1083,54 @@ function New-GuiDetailForm {
         $form.Controls.Add($gbOpt)
 
         $chkNetFx = New-Object System.Windows.Forms.CheckBox
-        $chkNetFx.Text = '启用 .NET Framework 3.5（仅一般模式有效；很多老软件需要它）'
-        $chkNetFx.Location = New-Object System.Drawing.Point(12, 24)
+        $chkNetFx.Text = '启用 .NET Framework 3.5（默认启用、可取消；很多老软件需要它）'
+        $chkNetFx.Location = New-Object System.Drawing.Point(12, 20)
         $chkNetFx.Size = New-Object System.Drawing.Size(620, 24)
+        $chkNetFx.Checked = $true
         $gbOpt.Controls.Add($chkNetFx)
 
         $lblWu = New-Object System.Windows.Forms.Label
-        $lblWu.Text = 'Windows Update（仅激进模式有效）：'
-        $lblWu.Location = New-Object System.Drawing.Point(12, 54)
-        $lblWu.Size = New-Object System.Drawing.Size(300, 20)
+        $lblWu.Text = 'Windows Update 处理方式（影响装好后能否在线搜索驱动）：'
+        $lblWu.Location = New-Object System.Drawing.Point(12, 20)
+        $lblWu.Size = New-Object System.Drawing.Size(500, 20)
         $gbOpt.Controls.Add($lblWu)
 
         $rbWuPhysical = New-Object System.Windows.Forms.RadioButton
-        $rbWuPhysical.Text = '物理精简（默认，装好后无法在线搜索驱动且无法完整恢复）'
-        $rbWuPhysical.Location = New-Object System.Drawing.Point(24, 74)
-        $rbWuPhysical.Size = New-Object System.Drawing.Size(400, 22)
-        $rbWuPhysical.Checked = $true
+        $rbWuPhysical.Text = '物理精简（装好后无法在线搜索驱动，且无法完整恢复）'
+        $rbWuPhysical.Location = New-Object System.Drawing.Point(24, 44)
+        $rbWuPhysical.Size = New-Object System.Drawing.Size(390, 22)
         $gbOpt.Controls.Add($rbWuPhysical)
 
         $rbWuBlock = New-Object System.Windows.Forms.RadioButton
-        $rbWuBlock.Text = '仅屏蔽（可随时恢复）'
-        $rbWuBlock.Location = New-Object System.Drawing.Point(430, 74)
-        $rbWuBlock.Size = New-Object System.Drawing.Size(200, 22)
+        $rbWuBlock.Text = '仅屏蔽（默认，可随时恢复）'
+        $rbWuBlock.Location = New-Object System.Drawing.Point(420, 44)
+        $rbWuBlock.Size = New-Object System.Drawing.Size(212, 22)
+        $rbWuBlock.Checked = $true
         $gbOpt.Controls.Add($rbWuBlock)
 
         $script:GuiDlgChkNetFx = $chkNetFx
+        $script:GuiDlgLblWu = $lblWu
         $script:GuiDlgRbWuPhysical = $rbWuPhysical
         $script:GuiDlgRbWuBlock = $rbWuBlock
 
-        $y += 130
+        # 两个选项各自只在用得上的模式里出现（两者互不重叠，因此不必挪动任何布局）：
+        #   .NET Framework 3.5 → 仅一般模式（默认勾选，可取消）
+        #   Windows Update     → 仅激进模式（一般模式不涉及）
+        $script:GuiDlgOptGroup = $gbOpt
+        $script:GuiDlgSyncOptVisibility = {
+            $sel = $script:GuiDlgModeRadios | Where-Object { $_.Checked } | Select-Object -First 1
+            $isNormal = [bool]($sel -and ([string]$sel.Tag -eq 'normal'))
+            if ($script:GuiDlgChkNetFx) { $script:GuiDlgChkNetFx.Visible = $isNormal }
+            foreach ($c in @($script:GuiDlgLblWu, $script:GuiDlgRbWuPhysical, $script:GuiDlgRbWuBlock)) {
+                if ($c) { $c.Visible = -not $isNormal }
+            }
+            if ($script:GuiDlgOptGroup) {
+                $script:GuiDlgOptGroup.Size = New-Object System.Drawing.Size -ArgumentList @(648, $(if ($isNormal) { 54 } else { 78 }))
+            }
+        }
+        foreach ($rb in $modeRadios) { $rb.Add_CheckedChanged($script:GuiDlgSyncOptVisibility) }
+
+        $y += 94
     } else {
         $lblLiveWarn = New-Object System.Windows.Forms.Label
         $lblLiveWarn.Text = '注意：本操作直接修改当前正在运行的系统，改动立即生效且不可逆；' + [char]13 + [char]10 +
@@ -1132,8 +1156,9 @@ function New-GuiDetailForm {
     $btnBack.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($btnBack)
 
-    $script:GuiDlgModeRadios = $modeRadios
     $script:GuiDlgNeedIso = $needIso
+    # 让「其他选项」里的选项按当前模式就位（默认一般模式 → 只显示 .NET 3.5）
+    if ($needIso) { & $script:GuiDlgSyncOptVisibility }
 
     $btnStart.Add_Click({
         # 这里不设 DialogResult，先校验；通过后再设 OK 让窗口关闭
@@ -1832,8 +1857,8 @@ if ($Mode -eq 'aggressive') {
 # 派生布尔量：是否执行激进核心动作（WinSxS / Update / Defender）、是否移除 Edge
 $aggressiveCore = ($Mode -in @('aggressive', 'aggressive_keepedge'))
 $removeEdge = ($Mode -eq 'aggressive')
-# Windows Update 处理方式（默认物理精简；制作 ISO 的两种激进模式会在确认前询问用户）
-$script:WUHandling = 'physical'
+# Windows Update 处理方式（默认仅屏蔽；制作 ISO 的两种激进模式会在确认前询问用户）
+$script:WUHandling = 'block'
 Write-Output " "
 
 $hostArchitecture = $Env:PROCESSOR_ARCHITECTURE
@@ -2005,12 +2030,12 @@ if (-not $script:LiveMode) {
         $enableNetFx3 = $true
         Write-Output "已通过 -NetFx3 参数指定：启用 .NET Framework 3.5。"
     } elseif ($script:GuiMode) {
-        # 界面模式下不能停下来等键盘：未勾选即视为不启用（$NetFx3 是开关型参数，为假也会落到这里）
+        # 界面模式下不能停下来等键盘：以窗口里的复选框为准（窗口里默认已勾选「启用」）
         $enableNetFx3 = $false
         Write-Output "已按界面选择：不启用 .NET Framework 3.5。"
     } else {
-        $netfxInput = Read-Host "是否启用 .NET Framework 3.5？（镜像做好后无法再启用；Y/N，直接回车 = 不启用）"
-        $enableNetFx3 = ($netfxInput -match '^[Yy]')
+        $netfxInput = Read-Host "是否启用 .NET Framework 3.5？（镜像做好后无法再启用；Y/N，直接回车 = 启用）"
+        $enableNetFx3 = ($netfxInput -notmatch '^[Nn]')
     }
     if ($aggressiveCore) {
         Write-Output "激进模式不启用 .NET Framework 3.5。"
@@ -2021,26 +2046,26 @@ if (-not $script:LiveMode) {
     }
 
     # Windows Update 处理方式（两种激进模式、仅制作 ISO 时询问）：物理精简 or 仅屏蔽。
-    # 物理精简 = 删除 UsoSvc / WaaSMedicSVC 服务键（既有行为）：装好的系统无法使用 Windows
+    # 物理精简 = 删除 UsoSvc / WaaSMedicSVC 服务键：装好的系统无法使用 Windows
     #            自动在线搜索驱动，且无法完整恢复。
     # 仅屏蔽   = 不删任何服务键，只禁用服务（含传递优化 DoSvc）并屏蔽更新策略：
     #            装好后可按 README《解除禁用》章节随时恢复或再次屏蔽。
-    # 静默传参（-Mode）不询问，默认物理精简，与既有行为一致。
+    # 默认值 = 仅屏蔽（更安全、可恢复）；静默传参（-Mode）不询问时也走这个默认值。
     if ($aggressiveCore) {
         Write-Output " "
         Write-Output "Windows Update 处理方式（影响装好后的系统能否使用 Windows 自动在线搜索驱动）："
         Write-Output "  1 = 物理精简：删除 Windows Update 编排服务键（UsoSvc / WaaSMedicSVC），无法完整恢复。"
         Write-Output " "
-        Write-Output "  2 = 仅屏蔽  ：不删服务键，只禁用服务（含传递优化）并屏蔽更新策略，可随时恢复。"
+        Write-Output "  2 = 仅屏蔽  ：不删服务键，只禁用服务（含传递优化）并屏蔽更新策略，可随时恢复。（默认）"
         Write-Output " "
-        $wuInput = $(if ($script:GuiMode -and $script:GuiWuHandling) { '' } else { Read-Host "请选择 Windows Update 处理方式（1/2，直接回车 = 1 物理精简）" })
+        $wuInput = $(if ($script:GuiMode -and $script:GuiWuHandling) { '' } else { Read-Host "请选择 Windows Update 处理方式（1/2，直接回车 = 2 仅屏蔽）" })
         if ($script:GuiMode -and $script:GuiWuHandling) {
             $script:WUHandling = [string]$script:GuiWuHandling
             Write-Output "已按界面选择的处理方式执行：$($script:WUHandling)。"
         } else {
             switch -Regex ($wuInput) {
-                '^[2二]$|屏蔽|block' { $script:WUHandling = 'block' }
-                default { $script:WUHandling = 'physical' }
+                '^[1一]$|物理|physical' { $script:WUHandling = 'physical' }
+                default { $script:WUHandling = 'block' }
             }
         }
         if ($script:WUHandling -eq 'block') {
