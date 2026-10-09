@@ -3,7 +3,7 @@
     精简 Windows 11：制作精简 ISO / 精简当前系统 / 独立维护小工具（多模式中文版）。
 #>
 
-# 版本 3.5
+# 版本 3.7
 
 #---------[ 参数 ]---------#
 param (
@@ -224,18 +224,21 @@ function Remove-RegistryValue {
 #---------[ 本机默认用户配置单元（活动系统用）]---------#
 # 活动系统的「用户级设置」要双写：当前用户（HKCU）+ 默认用户模板（Users\Default\ntuser.dat）。
 # 模板需要临时加载成 zDEFUSER 才能写；加载失败不中止（只影响模板侧，当前用户侧照常写入）。
+# 注意：本函数返回布尔值、且调用方是赋值接收（$script:LiveDefaultHiveMounted = 本函数）。
+# 因此提示必须走 Write-Host —— 用 Write-Output 会让日志行混进返回值，赋值结果变成非空数组，
+# 「恒为真」，于是即便加载失败，后面仍会去卸载一个根本没挂上的 hive。
 function Mount-DefaultUserHiveLive {
     $file = Join-Path $env:SystemDrive 'Users\Default\ntuser.dat'
     if (-not (Test-Path -LiteralPath $file)) {
-        Write-Output "未找到默认用户配置单元（$file），用户级设置只写当前用户。"
+        Write-Host "未找到默认用户配置单元（$file），用户级设置只写当前用户。"
         return $false
     }
     & 'reg' 'load' 'HKLM\zDEFUSER' $file | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Write-Output "默认用户配置单元加载失败（reg 退出码 $LASTEXITCODE），用户级设置只写当前用户。"
+        Write-Host "默认用户配置单元加载失败（reg 退出码 $LASTEXITCODE），用户级设置只写当前用户。"
         return $false
     }
-    Write-Output "已加载默认用户配置单元：$file"
+    Write-Host "已加载默认用户配置单元：$file"
     return $true
 }
 
@@ -318,6 +321,46 @@ function Grant-AdminFullAccess {
     } else {
         & 'takeown' '/f' $path | Out-Null
         & 'icacls' $path '/grant' "$($adminGroup.Value):(F)" '/C' | Out-Null
+    }
+}
+
+#---------[ 注册表项的「管理员完全控制」（.NET 访问控制助手）]---------#
+# 个别服务键（如 DPS / TrkWks）在系统镜像里带有独立的严格 ACL，其安全描述符与同父键下的
+# 其它服务不同（实测：这两个键的 SD 偏移与 PcaSvc/WSearch 明显不同），因此 reg add 直接写
+# Start 会返回退出码 1 —— 即便是管理员身份。要写进去必须先取得所有权并把完全控制授予管理员组。
+#
+# 用 .NET 的注册表访问控制对象 + Set-Acl，而不是改键路径指向、也不是调用外部授权工具：
+#   - 不动键本身，只替换它的安全描述符，语义干净；
+#   - 不必落盘临时文件、不依赖额外 exe，参数由类型系统校验，出错会抛异常而不是静默失败；
+#   - 与文件侧的 Grant-AdminFullAccess 对位，注册表现有访问控制也统一走本助手。
+#
+# 权限结构：三项完全控制必须一次写全，不能只补管理员一项 —— 授权是「整体替换」而非追加，
+# 只写 Administrators 会把 SYSTEM 与 Creator Owner 的权限一并抹掉，反而破坏系统对该键的访问。
+# 因此固定给出三项：Administrators（管理员组，供本脚本写入）、Creator Owner（创建者）、
+# SYSTEM（系统账户），与 Windows 对服务键的默认授权结构保持一致。
+#
+# 注意 SetOwner 需要 SeTakeOwnershipPrivilege（管理员令牌默认持有），脚本已要求管理员身份运行。
+function Grant-RegistryFullAccess {
+    param ([string]$Key)
+    try {
+        # 统一用 Registry:: 前缀，避免 HKLM: 驱动器在 hive 频繁装卸后短暂失效导致读取失败。
+        $subKey = $Key -replace '^HKLM\\', '' -replace '^HKEY_LOCAL_MACHINE\\', ''
+        $acl = Get-Acl -Path "Registry::$Key" -ErrorAction Stop
+        $acl.SetOwner($adminGroup)
+        foreach ($identity in @($adminGroup, (New-Object System.Security.Principal.NTAccount('CREATOR OWNER')),
+                (New-Object System.Security.Principal.NTAccount('SYSTEM')))) {
+            $rule = New-Object System.Security.AccessControl.RegistryAccessRule($identity,
+                [System.Security.AccessControl.RegistryRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl.AddAccessRule($rule)
+        }
+        Set-Acl -Path "Registry::$Key" -AclObject $acl -ErrorAction Stop
+        return $true
+    } catch {
+        Write-Host "      注册表授权失败（$subKey）：$($_.Exception.Message)"
+        return $false
     }
 }
 
@@ -558,36 +601,36 @@ function Clear-StaleState {
     if (@($Mounts).Count -gt 0) {
         foreach ($m in @($Mounts)) {
             if (-not $m.MountPath -or ($m.MountPath -notmatch '^[A-Za-z]:\\')) {
-                Write-Output "跳过卸载：挂载记录缺少有效的挂载点（$($m.Text)），交给 Dism.exe /Cleanup-WIM 处理。"
+                Write-Host "跳过卸载：挂载记录缺少有效的挂载点（$($m.Text)），交给 Dism.exe /Cleanup-WIM 处理。"
                 continue
             }
-            Write-Output "正在丢弃式卸载遗留的挂载映像：$($m.MountPath) ..."
+            Write-Host "正在丢弃式卸载遗留的挂载映像：$($m.MountPath) ..."
             try {
                 Dismount-WindowsImage -Path $m.MountPath -Discard -ErrorAction Stop
-                Write-Output "已卸载（未提交的改动已丢弃）：$($m.MountPath)"
+                Write-Host "已卸载（未提交的改动已丢弃）：$($m.MountPath)"
             } catch {
-                Write-Output "卸载未成功：$_"
+                Write-Host "卸载未成功：$_"
             }
         }
-        Write-Output "正在执行 Dism.exe /Cleanup-WIM 清理孤儿挂载记录..."
+        Write-Host "正在执行 Dism.exe /Cleanup-WIM 清理孤儿挂载记录..."
         & Dism.exe '/Cleanup-WIM'
-        Write-Output "Dism.exe /Cleanup-WIM 返回码 $LASTEXITCODE。"
+        Write-Host "Dism.exe /Cleanup-WIM 返回码 $LASTEXITCODE。"
         $left = @(@(Get-WimmountRecords) | Where-Object { $_.WimPath -match '(?i)\\tiny11\\sources\\install\.wim$' })
         if (@($left).Count -gt 0) {
-            Write-Output "挂载仍未卸载，升级处理：结束滞留的 DISM worker 进程后重试..."
+            Write-Host "挂载仍未卸载，升级处理：结束滞留的 DISM worker 进程后重试..."
             Stop-LingeringDismWorkers
             foreach ($m in $left) {
-                Write-Output "正在丢弃式卸载遗留的挂载映像：$($m.MountPath) ..."
+                Write-Host "正在丢弃式卸载遗留的挂载映像：$($m.MountPath) ..."
                 try {
                     Dismount-WindowsImage -Path $m.MountPath -Discard -ErrorAction Stop
-                    Write-Output "已卸载（未提交的改动已丢弃）：$($m.MountPath)"
+                    Write-Host "已卸载（未提交的改动已丢弃）：$($m.MountPath)"
                 } catch {
-                    Write-Output "卸载仍未成功：$_"
+                    Write-Host "卸载仍未成功：$_"
                 }
             }
-            Write-Output "正在执行 Dism.exe /Cleanup-WIM 清理孤儿挂载记录..."
+            Write-Host "正在执行 Dism.exe /Cleanup-WIM 清理孤儿挂载记录..."
             & Dism.exe '/Cleanup-WIM'
-            Write-Output "Dism.exe /Cleanup-WIM 返回码 $LASTEXITCODE。"
+            Write-Host "Dism.exe /Cleanup-WIM 返回码 $LASTEXITCODE。"
         }
     }
 
@@ -595,8 +638,8 @@ function Clear-StaleState {
     # 被删会掏空正在挂载的映像（实测发生过 tiny11 被删而挂载仍在）。
     $ourMountsLeft = @(@(Get-WimmountRecords) | Where-Object { $_.WimPath -match '(?i)\\tiny11\\sources\\install\.wim$' })
     if (@($ourMountsLeft).Count -gt 0) {
-        Write-Output "仍有 $($ourMountsLeft.Count) 个本工具的挂载未能终结，所有临时目录都不删除。"
-        foreach ($m in $ourMountsLeft) { Write-Output "      · 挂载点 $($m.MountPath)   <=   $($m.WimPath)" }
+        Write-Host "仍有 $($ourMountsLeft.Count) 个本工具的挂载未能终结，所有临时目录都不删除。"
+        foreach ($m in $ourMountsLeft) { Write-Host "      · 挂载点 $($m.MountPath)   <=   $($m.WimPath)" }
         return $false
     }
     # 内核层交叉确认：注册表记录可能已清但实际挂载仍在（两者可能不同步）。读不到就按仍有挂载处理。
@@ -610,18 +653,18 @@ function Clear-StaleState {
         }
     } catch {
         $kernelUnknown = $true
-        Write-Output "无法查询内核挂载状态（$_），为安全起见按「仍有挂载」处理。"
+        Write-Host "无法查询内核挂载状态（$_），为安全起见按「仍有挂载」处理。"
     }
     if ($kernelUnknown) { return $false }
     foreach ($dp in @(@($Dirs) | ForEach-Object { $_.Path.TrimEnd('\') })) {
         if ($kernelMountPaths -contains $dp) {
-            Write-Output "内核中仍有挂载落在 $dp 上，所有临时目录都不删除。"
+            Write-Host "内核中仍有挂载落在 $dp 上，所有临时目录都不删除。"
             return $false
         }
     }
 
     foreach ($d in @($Dirs)) {
-        Write-Output "正在删除遗留的临时目录：$($d.Path)"
+        Write-Host "正在删除遗留的临时目录：$($d.Path)"
         & cmd /c rd /s /q "$($d.Path)"
         # 若它正位于专用容器下，容器空了就一并收掉。rd 不带 /s：目录非空会直接失败、不动任何东西，
         # 所以即使该容器里还有别的东西，也绝不会被连带删除。
@@ -704,13 +747,35 @@ function Write-ResultBanner {
     Write-Host ''
 }
 
+# 弹出图形界面流程中由本脚本装载的 ISO（收尾清理，正常完成与中止两条路径都会走到）。
+# 只弹「本脚本挂的」（Mount-GuiIso 里 MountedNow 为真的才记录在案）；用户事先自己挂载的 ISO 不动。
+# 施工阶段的全部操作都针对临时目录里的副本，不占用 ISO 盘符，因此任何时点弹出都安全。
+# 失败容忍：弹不掉只提示手动弹出，不中止脚本。返回 $true = 无需弹出或全部弹出成功。
+function Dismount-GuiMountedIsos {
+    if (-not $script:GuiMountedByUs) { return $true }
+    $allOk = $true
+    $isoPaths = @($script:GuiMountedIsoPaths) | Select-Object -Unique
+    foreach ($isoPath in $isoPaths) {
+        try {
+            Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop | Out-Null
+            Write-Host "已自动弹出参数窗口中装载的 ISO：$isoPath"
+        } catch {
+            $allOk = $false
+            Write-Host "自动弹出 ISO 失败（$isoPath）：$_"
+            Write-Host "可在「此电脑」中右键该 ISO 选择「弹出」。"
+        }
+    }
+    return $allOk
+}
+
 function Stop-AndExit {
     param (
         [int]$Code = 1,
         [string]$Reason = ''
     )
-    # 中止脚本前先释放单实例锁，再停掉转录，保证日志有结尾标记且内容已刷盘。
-    # 未开启转录时 Stop-Transcript 会抛异常，故忽略。
+    # 中止脚本前先弹出本脚本装载的 ISO（失败容忍），再释放单实例锁，最后停掉转录，
+    # 保证日志有结尾标记且内容已刷盘。未开启转录时 Stop-Transcript 会抛异常，故忽略。
+    Dismount-GuiMountedIsos | Out-Null
     Remove-RunningLock
     try { Stop-Transcript | Out-Null } catch { }
     # 执行阶段的提示一律走控制台（窗口只用于开头的参数收集）：
@@ -1037,8 +1102,12 @@ function New-GuiDetailForm {
             }
             $script:GuiDlgIsoLetter = $res.Letter
             $script:GuiDlgTxtIso.Text = $ofd.FileName
-            if ($res.MountedNow) { $script:GuiMountedByUs = $true }
-            $script:GuiMountedLetters = @($script:GuiMountedLetters) + @($res.Letter)
+            if ($res.MountedNow) {
+                $script:GuiMountedByUs = $true
+                # 记录镜像文件路径（而非盘符）：收尾时 Dismount-DiskImage 按路径弹出；
+                # 用户反复换选不同 ISO 时逐个累积，收尾一并弹出。
+                $script:GuiMountedIsoPaths = @($script:GuiMountedIsoPaths) + @($ofd.FileName)
+            }
             if (@($res.Images).Count -gt 0) {
                 foreach ($im in $res.Images) {
                     $script:GuiDlgIndexMap += [int]$im.ImageIndex
@@ -1056,7 +1125,7 @@ function New-GuiDetailForm {
 
         # —— 临时盘 ——
         $gbScratch = New-Object System.Windows.Forms.GroupBox
-        $gbScratch.Text = '临时盘与成品存放位置（需 20GB 以上空闲）'
+        $gbScratch.Text = '临时文件与最终 ISO 所在盘符（需预留 20GB+ 空闲）'
         $gbScratch.Location = New-Object System.Drawing.Point(16, $y)
         $gbScratch.Size = New-Object System.Drawing.Size(648, 68)
         $form.Controls.Add($gbScratch)
@@ -1293,7 +1362,7 @@ $script:GuiTaskInput = ''
 $script:GuiImageIndex = 0
 $script:GuiWuHandling = ''
 $script:GuiMountedByUs = $false
-$script:GuiMountedLetters = @()
+$script:GuiMountedIsoPaths = @()
 $hasAnyArg = [bool]($ISO -or $SCRATCH -or $Mode -or $NetFx3)
 if (-not $hasAnyArg) {
     try {
@@ -1586,15 +1655,47 @@ function Set-RegistryValueOr {
     Set-RegistryValue $path $name 'REG_DWORD' ('0x{0:x}' -f $new)
 }
 
+# 写服务的 Start=4（禁用）。多数服务键可直接写，但个别键（实测 DPS / TrkWks）在镜像里带
+# 独立严格 ACL，reg add 会返回退出码 1。这里做成「先试写、失败则授权重试、仍失败才报失败」：
+#   1) 先直接写一次。成功即返回（绝大多数服务走这条快路，且不会平白改动键的 ACL）。
+#   2) 失败则用 Grant-RegistryFullAccess 把该键授权给管理员完全控制，再写一次。
+#   3) 仍失败才输出失败行（保持与 Set-RegistryValue 一致的日志措辞，便于按行核对）。
+# 只在需要时才动 ACL —— 授权会替换键的权限，无必要就不碰。
+function Set-ServiceStartValue {
+    param ([string]$path, [string]$serviceName)
+    if (Test-LiveSkipRegPath $path) {
+        Write-Output "（活动系统：跳过只对 OOBE 有意义的项）$path\Start"
+        return
+    }
+    $target = Get-TargetRegPath $path
+    & 'reg' 'add' $target '/v' 'Start' '/t' 'REG_DWORD' '/d' '4' '/f' | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "服务键带受限 ACL，正在取得所有权后重试：$target"
+        if (Grant-RegistryFullAccess $target) {
+            & 'reg' 'add' $target '/v' 'Start' '/t' 'REG_DWORD' '/d' '4' '/f' | Out-Null
+        }
+    }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "已设置注册表项：$target\Start"
+        if ($script:LiveMode) { Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue }
+    } else {
+        Write-Output "设置注册表项失败（reg 退出码 $LASTEXITCODE）：$target\Start"
+    }
+}
+
 # 带日志的「按注册表定位清理目标」：这类项的目标目录是从注册表读出来的，
 # 只报「清理 N 项」用户无法核对清的是哪个目录，因此把定位结果一并写进日志。
+# 注意：提示必须走 Write-Host（直写宿主，不进输出流）。若用 Write-Output，
+# 这些日志行会与 return $p 一起被当作函数返回值返回，调用方拿到的 $p 就是个数组
+# （甚至当注册表无记录时，$p 会变成日志字符串本身，后半段 if ($p) 仍然为真），
+# 于是日志文本被当成路径传给 Get-ChildItem，整项清理静默失效。
 function Get-JunkPathFromReg {
     param ([string]$Key, [string]$Name)
     $p = Get-RegValueString $Key $Name
     if ($p) {
-        Write-Output "      注册表定位：$Key → $p"
+        Write-Host "      注册表定位：$Key → $p"
     } else {
-        Write-Output "      注册表无记录，跳过：$Key（该软件未安装或已被清理）"
+        Write-Host "      已检查：注册表无记录，本机未安装该软件，跳过：$Key"
     }
     return $p
 }
@@ -1724,7 +1825,9 @@ function Invoke-SpecialJunk {
             $referenced = @{}
             $patchOut = & 'reg' 'query' 'HKLM\SOFTWARE\Classes\Installer\Patches' '/s' 2>&1
             foreach ($line in $patchOut) { if ($line -match '(.+?\.msp)\s*$') { $referenced[$Matches[1].ToLower()] = $true } }
-            Write-Output "      注册表定位：HKLM\SOFTWARE\Classes\Installer\Patches 下登记补丁 $($referenced.Count) 个（未被登记的 .msp 视为可删）"
+            # 同样是给用户看的提示，必须走 Write-Host —— 否则会混进 return @($removed, $failed)，
+            # 把 $removed 污染成日志字符串，调用方累加时抛「无法转换为 System.Int32」。
+            Write-Host "      注册表定位：HKLM\SOFTWARE\Classes\Installer\Patches 下登记补丁 $($referenced.Count) 个（未被登记的 .msp 视为可删）"
             $installerDir = Join-Path $Root 'Windows\Installer'
             foreach ($f in @(Get-ChildItem -LiteralPath $installerDir -Filter '*.msp' -File -Force -ErrorAction SilentlyContinue)) {
                 if (-not $referenced.ContainsKey($f.Name.ToLower())) {
@@ -2983,8 +3086,9 @@ if ($script:LiveMode) { Stop-Service -Name 'PcaSvc' -Force -ErrorAction Silently
 Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\RemoteRegistry' 'Start' 'REG_DWORD' '4'
 if ($script:LiveMode) { Stop-Service -Name 'RemoteRegistry' -Force -ErrorAction SilentlyContinue }
 # O139 禁用诊断服务
-Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\DPS' 'Start' 'REG_DWORD' '4'
-if ($script:LiveMode) { Stop-Service -Name 'DPS' -Force -ErrorAction SilentlyContinue }
+# DPS 与 TrkWks 两个键带独立严格 ACL（见 Grant-RegistryFullAccess 的说明），直接写会失败，
+# 因此走「先试写、失败则授权后重试」的入口。
+Set-ServiceStartValue 'HKLM\zSYSTEM\ControlSet001\Services\DPS' 'DPS'
 # O141 禁用Windows Search
 Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\WSearch' 'Start' 'REG_DWORD' '4'
 if ($script:LiveMode) { Stop-Service -Name 'WSearch' -Force -ErrorAction SilentlyContinue }
@@ -2992,8 +3096,7 @@ if ($script:LiveMode) { Stop-Service -Name 'WSearch' -Force -ErrorAction Silentl
 Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\WerSvc' 'Start' 'REG_DWORD' '4'
 if ($script:LiveMode) { Stop-Service -Name 'WerSvc' -Force -ErrorAction SilentlyContinue }
 # O145 禁用NTFS链接跟踪服务（by 某宅）
-Set-RegistryValue 'HKLM\zSYSTEM\ControlSet001\Services\TrkWks' 'Start' 'REG_DWORD' '4'
-if ($script:LiveMode) { Stop-Service -Name 'TrkWks' -Force -ErrorAction SilentlyContinue }
+Set-ServiceStartValue 'HKLM\zSYSTEM\ControlSet001\Services\TrkWks' 'TrkWks'
 
 # --- 三、用户级设置（默认用户模板 + 系统默认配置单元；活动系统为当前用户 + 模板）---
 # O001 将任务栏中的Cortana调整为
@@ -3594,9 +3697,12 @@ if ($script:LiveMode) {
 
 #---------[ 收尾：先释放单实例锁、结束日志，再打完成横幅 ]---------#
 # 顺序很关键：先把日志与锁收干净，最后才把结果打到控制台上。
+# 图形界面流程中由本脚本装载的 ISO 在这里自动弹出（只弹「本脚本挂的」），
+# 用户做完就能立即移动 / 删除 / 重命名成品；弹不掉时会在横幅里提示手动弹出。
 # Stop-Transcript 会由 PowerShell 自身在控制台上打印一行「已停止脚本，输出文件为 …」，
 # 这行无法被重定向或抑制（它不经 PowerShell 输出流），紧跟在「制作完成」之后容易被误读成
 # 「脚本异常停止」。因此停掉转录后立刻清屏并重打完成横幅，让用户看到的最后画面是明确的结果。
+$isoDismounted = Dismount-GuiMountedIsos
 Remove-RunningLock
 Stop-Transcript | Out-Null
 try { Clear-Host } catch { }
@@ -3607,14 +3713,17 @@ if ($script:LiveMode) {
         "日志保存在：$PSScriptRoot\LOG"
     )
 } else {
-    Write-ResultBanner -Color 'Green' -Lines @(
+    $bannerLines = @(
         '制作已完成。',
         '生成的 ISO 文件：',
         $isoOutputPath,
         '',
-        '刚才在参数窗口里装载的 ISO 仍处于装载状态，可在「此电脑」中右键它选择「弹出」。',
         "日志保存在：$PSScriptRoot\LOG"
     )
+    if (-not $isoDismounted) {
+        $bannerLines += '参数窗口中装载的 ISO 未能自动弹出，请在「此电脑」中右键它选择「弹出」。'
+    }
+    Write-ResultBanner -Color 'Green' -Lines $bannerLines
 }
 
 exit
