@@ -3,7 +3,7 @@
     精简 Windows 11：制作精简 ISO / 精简当前系统 / 独立维护小工具（多模式中文版）。
 #>
 
-# 版本 3.8
+# 版本 3.9
 
 #---------[ 参数 ]---------#
 param (
@@ -2537,6 +2537,15 @@ foreach ($package in $packagesToRemove) {
 Write-Output "预装应用移除完成：成功 $removeSucceeded / 失败 $removeFailed。"
 if ($script:LiveMode) {
     Remove-InstalledAppx $packagePrefixes
+
+    # 所有用户：Xbox Game Bar 可能已装在其他用户配置下，Remove-InstalledAppx 只枚举当前用户，
+    # 覆盖不到；这里用 -AllUsers 逐个用户实例卸载。
+    # 只在活动系统执行：制作 ISO 时 Get-AppxPackage -AllUsers 查的是宿主机本机，与映像无关，
+    # 既卸不到映像里的包，还可能误删宿主机的真实应用。
+    Write-Output "正在卸载所有用户的 Xbox Game Bar（Microsoft.XboxGamingOverlay）..."
+    Get-AppxPackage -Name 'Microsoft.XboxGamingOverlay' -AllUsers -ErrorAction SilentlyContinue |
+        Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+    Write-Output "所有用户的 Xbox Game Bar 卸载动作已完成。"
 }
 
 # ===== Microsoft Store / StorePurchaseApp / SecureAssessmentBrowser（所有模式均移除）=====
