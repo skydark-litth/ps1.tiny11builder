@@ -3,7 +3,7 @@
     精简 Windows 11：制作精简 ISO / 精简当前系统 / 独立维护小工具（多模式中文版）。
 #>
 
-# 版本 3.7
+# 版本 3.8
 
 #---------[ 参数 ]---------#
 param (
@@ -1665,6 +1665,14 @@ function Set-ServiceStartValue {
     param ([string]$path, [string]$serviceName)
     if (Test-LiveSkipRegPath $path) {
         Write-Output "（活动系统：跳过只对 OOBE 有意义的项）$path\Start"
+        return
+    }
+    if ($script:LiveMode) {
+        # 活动系统：DPS / TrkWks 这两个键带独立严格 ACL，写注册表必被拒；而授权重试（Grant-RegistryFullAccess）
+        # 改的是本机真实键的所有者与权限，副作用不可取。故改用 SCM 禁用（以 SYSTEM 操作服务对象，绕过键 ACL）。
+        Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+        Set-Service -Name $serviceName -StartupType Disabled -ErrorAction SilentlyContinue
+        Write-Output "已禁用服务启动（活动系统）：$serviceName"
         return
     }
     $target = Get-TargetRegPath $path
